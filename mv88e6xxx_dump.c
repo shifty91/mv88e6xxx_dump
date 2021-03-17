@@ -42,6 +42,9 @@
 #define MV88E6351	6351
 #define MV88E6390	6390
 
+#define HELLCREEK_4C30		0x4c30
+#define HELLCREEK_NUM_PORTS	4
+
 #define MAX_PORTS 11
 
 struct mv88e6xxx_ctx
@@ -49,6 +52,8 @@ struct mv88e6xxx_ctx
 	struct mnlg_socket *nlg;
 	const char *bus_name;
 	const char *dev_name;
+	const char *atu_name;
+	const char *vtu_name;
 	unsigned int chip;
 	int ports;
 	bool repeat;
@@ -75,6 +80,23 @@ struct mv88e6xxx_devlink_vtu_entry {
 	uint16_t vid;
 	uint16_t data[3];
 	uint16_t resvd;
+};
+
+struct hellcreek_devlink_vlan_entry {
+	uint16_t vid;
+	uint16_t member;
+};
+
+struct hellcreek_fdb_entry {
+	size_t idx;
+	unsigned char mac[6];
+	unsigned char portmask;
+	unsigned char age;
+	unsigned char is_obt;
+	unsigned char pass_blocked;
+	unsigned char is_static;
+	unsigned char reprio_tc;
+	unsigned char reprio_en;
 };
 
 void usage(const char *progname)
@@ -1404,6 +1426,44 @@ static void atu_mv88e6xxx(struct mv88e6xxx_ctx *ctx, uint16_t portvec_mask,
 	}
 }
 
+static void atu_hellcreek(struct mv88e6xxx_ctx *ctx)
+{
+	int entries, i, portvec_bits = HELLCREEK_NUM_PORTS;
+	struct hellcreek_fdb_entry *table;
+	uint16_t portvec;
+	char buffer[16];
+
+	table = (struct hellcreek_fdb_entry *)ctx->snapshot_data;
+	entries = ctx->data_len / sizeof(struct hellcreek_fdb_entry);
+
+	printf("FID  MAC	       ");
+	for (i = 0; i < portvec_bits; i++)
+		putchar(ports_labels[i]);
+	printf(" Age OBT Pass Static Reprio Prio\n");
+
+	for (i = 0; i < entries; i++) {
+		unsigned char null_addr[6] = { 0 };
+
+		if (!memcmp(null_addr, table[i].mac, sizeof(null_addr)))
+			continue;
+
+		printf("%4d %02x:%02x:%02x:%02x:%02x:%02x ",
+		       (int)table[i].idx,
+		       table[i].mac[0], table[i].mac[1], table[i].mac[2],
+		       table[i].mac[3], table[i].mac[4], table[i].mac[5]);
+
+		printf("%4s ", binary(buffer, table[i].portmask,
+				      HELLCREEK_NUM_PORTS));
+
+		printf("%3d %3s %4s %6s %7s %4d\n",
+		       table[i].age, table[i].is_obt ? "X" : "",
+		       table[i].pass_blocked ? "X" : "",
+		       table[i].is_static ? "X" : "",
+		       table[i].reprio_en ? "X" : "",
+		       table[i].reprio_tc);
+	}
+}
+
 char tagging[] = {'V', 'U', 'T','X'};
 
 static void vtu_mv88e6xxx(struct mv88e6xxx_ctx *ctx, uint16_t fid_mask)
@@ -1459,17 +1519,55 @@ static void vtu_mv88e6xxx(struct mv88e6xxx_ctx *ctx, uint16_t fid_mask)
 	}
 }
 
+static const char hellcreek_tagging[] = { 'X', 'U', 'R', 'T' };
+
+static void vtu_hellcreek(struct mv88e6xxx_ctx *ctx)
+{
+	struct hellcreek_devlink_vlan_entry *table;
+	int entries, i, p;
+
+	table = (struct hellcreek_devlink_vlan_entry *)ctx->snapshot_data;
+	entries = ctx->data_len / sizeof(struct hellcreek_devlink_vlan_entry);
+
+	printf("\tU - a member, egress untagged\n");
+	printf("\tT - a member, egress tagged\n");
+	printf("\tX - not a member, Ingress frames with VID discarded\n");
+
+	printf("VID  ");
+	for (p = 0; p < HELLCREEK_NUM_PORTS; p++)
+		printf("%1x", p);
+	printf("\n");
+
+	for (i = 0; i < entries; i++) {
+		if (!table[i].member)
+			continue;
+
+		printf("%4d ", table[i].vid);
+
+		for (p = 0; p < HELLCREEK_NUM_PORTS; p++) {
+			uint16_t tmp = table[i].member;
+
+			tmp &= 0x03 << (p * 2);
+			tmp >>= p * 2;
+
+			printf("%c", hellcreek_tagging[tmp]);
+		}
+
+		printf("\n");
+	}
+}
+
 static void cmd_atu(struct mv88e6xxx_ctx *ctx)
 {
 	int err;
 
 	printf("ATU:\n");
 
-	err = new_snapshot(ctx, "atu");
+	err = new_snapshot(ctx, ctx->atu_name);
 	if (err)
 		return;
 
-	err = dump_snapshot(ctx, "atu");
+	err = dump_snapshot(ctx, ctx->atu_name);
 	if (err)
 		return;
 
@@ -1504,8 +1602,10 @@ static void cmd_atu(struct mv88e6xxx_ctx *ctx)
 	case MV88E6161:
 	case MV88E6165:
 		return atu_mv88e6xxx(ctx, 0x03f, 6);
+	case HELLCREEK_4C30:
+		return atu_hellcreek(ctx);
 	default:
-		printf("Unknown mv88e6xxx chip %d\n", ctx->chip);
+		printf("Unknown mv88e6xxx/hellcreek chip %d\n", ctx->chip);
 	}
 
 	return;
@@ -1517,11 +1617,11 @@ static void cmd_vtu(struct mv88e6xxx_ctx *ctx)
 
 	printf("VTU:\n");
 
-	err = new_snapshot(ctx, "vtu");
+	err = new_snapshot(ctx, ctx->vtu_name);
 	if (err)
 		return;
 
-	err = dump_snapshot(ctx, "vtu");
+	err = dump_snapshot(ctx, ctx->vtu_name);
 	if (err)
 		return;
 
@@ -1554,8 +1654,10 @@ static void cmd_vtu(struct mv88e6xxx_ctx *ctx)
 	case MV88E6123:
 	case MV88E6161:
 	case MV88E6165:
+	case HELLCREEK_4C30:
+		return vtu_hellcreek(ctx);
 	default:
-		printf("Unknown mv88e6xxx chip %d\n", ctx->chip);
+		printf("Unknown mv88e6xxx/hellcreek chip %d\n", ctx->chip);
 	}
 	return;
 }
@@ -2034,8 +2136,9 @@ static int get_info_cb(const struct nlmsghdr *nlh, void *data)
 		return MNL_CB_ERROR;
 
 	driver_name = mnl_attr_get_str(tb[DEVLINK_ATTR_INFO_DRIVER_NAME]);
-	if (strcmp(driver_name, "mv88e6xxx")) {
-		printf("%s/%s is not an mv88e6xxx\n", ctx->bus_name,
+	if (strcmp(driver_name, "mv88e6xxx") &&
+	    strcmp(driver_name, "hellcreek")) {
+		printf("%s/%s is not an mv88e6xxx or hellcreek\n", ctx->bus_name,
 			ctx->dev_name);
 		exit(EXIT_FAILURE);
 	}
@@ -2066,10 +2169,20 @@ static int get_info_cb(const struct nlmsghdr *nlh, void *data)
 
 		ret = sscanf(ver_value, "Marvell 88E%ud", &ctx->chip);
 		if (ret != 1) {
-			printf("Unable to parse ASIC version %s\n",
-			       ver_value);
-			exit(EXIT_FAILURE);
+			ret = sscanf(ver_value, "r%x", &ctx->chip);
+			if (ret != 1) {
+				printf("Unable to parse ASIC version %s\n",
+				       ver_value);
+				exit(EXIT_FAILURE);
+			}
+
+			ctx->atu_name = "fdb";
+			ctx->vtu_name = "vlan";
+			return MNL_CB_OK;
 		}
+
+		ctx->atu_name = "atu";
+		ctx->vtu_name = "vtu";
 		return MNL_CB_OK;
 	}
 	return MNL_CB_OK;
